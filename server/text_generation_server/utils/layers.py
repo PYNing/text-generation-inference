@@ -205,6 +205,7 @@ class Linear4bit(nn.Module):
 
 
 def get_linear(weight, bias, quantize):
+    """构造量化后的线性层"""
     if quantize is None:
         linear = FastLinear(weight, bias)
     elif quantize == "bitsandbytes":
@@ -248,6 +249,9 @@ def get_linear(weight, bias, quantize):
                 bits,
                 groupsize,
             )
+    elif quantize == "smooth":
+        # TODO
+        raise NotImplementedError()
     else:
         raise NotImplementedError(f"Quantization `{quantize}` is not implemented yet.")
     return linear
@@ -259,6 +263,7 @@ class SuperLayer(nn.Module):
         self.linear = linear
 
     def forward(self, x):
+        """ 最终会调用到这里的层，linear 是各自量化算子的不同实现"""
         return self.linear.forward(x)
 
 

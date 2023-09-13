@@ -114,7 +114,7 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
             batch=next_batch.to_pb() if next_batch else None,
         )
 
-
+# 启动函数
 def serve(
     model_id: str,
     revision: Optional[str],
@@ -144,6 +144,7 @@ def serve(
             server_urls = [local_url]
 
         try:
+            # 加载模型
             model = get_model(
                 model_id, revision, sharded, quantize, dtype, trust_remote_code
             )

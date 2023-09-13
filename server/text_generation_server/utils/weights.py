@@ -17,8 +17,10 @@ class Weights:
         process_group,
         aliases: Optional[Dict[str, List[str]]] = None,
     ):
-        routing = {}
+        
+        routing = {}  # {“layername” ： “filename”}
         for filename in filenames:
+            # 加载文件中的所有层和权重
             with safe_open(filename, framework="pytorch") as f:
                 for k in f.keys():
                     if k in routing:
@@ -33,7 +35,7 @@ class Weights:
         self.device = device
         self.dtype = dtype
         self.process_group = process_group
-        self._handles = {}
+        self._handles = {} # {"filename": " opened safetensors"}
 
     def _get_handle(self, filename):
         if filename not in self._handles:
@@ -43,6 +45,7 @@ class Weights:
         return self._handles[filename]
 
     def get_filename(self, tensor_name: str) -> (str, str):
+        """通过 tensor_name 找到 filename"""
         filename = self.routing.get(tensor_name, None)
         if filename is None:
             aliases = self.aliases.get(tensor_name, [])
@@ -75,6 +78,7 @@ class Weights:
         return tensor
 
     def get_partial_sharded(self, tensor_name: str, dim: int):
+        """ 获取 DP 后的数据 """
         filename, tensor_name = self.get_filename(tensor_name)
         f = self._get_handle(filename)
         slice_ = f.get_slice(tensor_name)

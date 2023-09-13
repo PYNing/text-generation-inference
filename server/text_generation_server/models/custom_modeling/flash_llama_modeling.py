@@ -326,6 +326,8 @@ class LlamaMLP(nn.Module):
             dim=0,
             bias=False,
         )
+
+        # TensorParallelRowLinear 使用同步原语
         self.down_proj = TensorParallelRowLinear.load(
             config,
             prefix=f"{prefix}.down_proj",
@@ -405,9 +407,11 @@ class FlashLlamaModel(torch.nn.Module):
         process_group = weights.process_group
         self.tp_rank = process_group.rank()
         self.tp_world_size = process_group.size()
+        # TensorParallelEmbedding 使用同步原语
         self.embed_tokens = TensorParallelEmbedding(
             prefix="model.embed_tokens", weights=weights
         )
+        #  初始化所有权重，Layer层加载权重时会区分算子的量化实现方式
         self.layers = nn.ModuleList(
             [
                 FlashLlamaLayer(
@@ -449,6 +453,7 @@ class FlashLlamaModel(torch.nn.Module):
 
         residual = None
         for i, layer in enumerate(self.layers):
+            # 这里调用每层的 forward，在forward函数中，可能使用同步原语
             hidden_states, residual = layer(
                 hidden_states,
                 residual,
@@ -472,6 +477,7 @@ class FlashLlamaForCausalLM(torch.nn.Module):
         super().__init__()
 
         self.model = FlashLlamaModel(config, weights)
+        # TensorParallelHead 使用同步原语
         self.lm_head = TensorParallelHead.load(
             config,
             prefix="lm_head",
