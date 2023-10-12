@@ -88,4 +88,6 @@ class FlashLlama(FlashCausalLM):
             device=device,
             rank=rank,
             world_size=world_size,
+            tp_world_size=tp_world_size,
+            pp_world_size=pp_world_size,
         )
