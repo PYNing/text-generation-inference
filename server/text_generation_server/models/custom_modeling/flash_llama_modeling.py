@@ -171,7 +171,7 @@ def load_attention(config, prefix, weights):
 
 def _load_gqa(config, prefix: str, weights):
     assert config.hidden_size % config.num_attention_heads == 0
-    assert config.num_attention_heads % weights.process_group.size() == 0
+    assert config.num_attention_heads % weights.tp_group.size() == 0
 
     weight = weights.get_multi_weights_col(
         prefixes=[f"{prefix}.q_proj", f"{prefix}.k_proj", f"{prefix}.v_proj"],
@@ -183,8 +183,8 @@ def _load_gqa(config, prefix: str, weights):
         weight = weight.to(dtype=weights.dtype).to(device=weights.device)
 
         head_size = config.hidden_size // config.num_attention_heads
-        num_heads = config.num_attention_heads // weights.process_group.size()
-        num_key_value_heads = config.num_key_value_heads // weights.process_group.size()
+        num_heads = config.num_attention_heads // weights.tp_group.size()
+        num_key_value_heads = config.num_key_value_heads // weights.tp_group.size()
         assert list(weight.shape) == [
             (num_heads + 2 * num_key_value_heads) * head_size,
             config.hidden_size,
@@ -216,14 +216,14 @@ class FlashLlamaAttention(torch.nn.Module):
 
         self.softmax_scale = self.head_size**-0.5
 
-        if self.num_heads % weights.process_group.size() != 0:
+        if self.num_heads % weights.tp_group.size() != 0:
             raise ValueError(
                 f"`num_heads` must be divisible by `num_shards` (got `num_heads`: {self.num_heads} "
-                f"and `num_shards`: {weights.process_group.size()}"
+                f"and `num_shards`: {weights.tp_group.size()}"
             )
-        self.num_heads = self.num_heads // weights.process_group.size()
+        self.num_heads = self.num_heads // weights.tp_group.size()
         self.num_key_value_heads = (
-            config.num_key_value_heads // weights.process_group.size()
+            config.num_key_value_heads // weights.tp_group.size()
         )
 
         self.query_key_value = load_attention(config, prefix, weights)
@@ -333,7 +333,7 @@ class LlamaMLP(nn.Module):
             bias=False,
         )
         self.intermediate_size = (
-            config.intermediate_size // weights.process_group.size()
+            config.intermediate_size // weights.tp_group.size()
         )
 
     def forward(self, hidden_states):
@@ -403,8 +403,8 @@ class FlashLlamaModel(torch.nn.Module):
         super().__init__()
 
         process_group = weights.process_group
-        self.tp_rank = process_group.rank()
-        self.tp_world_size = process_group.size()
+        self.rank = process_group.rank()
+        self.world_size = process_group.size()
         self.embed_tokens = TensorParallelEmbedding(
             prefix="model.embed_tokens", weights=weights
         )

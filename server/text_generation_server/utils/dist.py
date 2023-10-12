@@ -83,28 +83,32 @@ def initialize_torch_distributed():
             if PP_WORLD_SIZE == 1: 
                 TP_WORLD_SIZE = WORLD_SIZE
                 return torch.distributed.group.WORLD, torch.distributed.group.WORLD, None, RANK, WORLD_SIZE, TP_WORLD_SIZE, PP_WORLD_SIZE
-            else:
-                assert PP_WORLD_SIZE == 2, f"Only Support PP_WORLD_SIZE == 2"
+            elif PP_WORLD_SIZE == 2:
                 assert WORLD_SIZE % PP_WORLD_SIZE == 0, f"WORLD_SIZE(which is {WORLD_SIZE}) is not divisible by PP_WORLD_SIZE(which is {PP_WORLD_SIZE})"
                 TP_WORLD_SIZE = WORLD_SIZE // PP_WORLD_SIZE
                 tp_begin_rank = RANK // TP_WORLD_SIZE * TP_WORLD_SIZE
                 tp_ranks = [tp_begin_rank + i for i in range(tp_begin_rank)]
                 tp_group = torch.distributed.new_group(
-                    rank=tp_ranks, 
+                    ranks=tp_ranks, 
                     timeout=timedelta(seconds=60), 
                     backend=backend, 
                     pg_options=options,
                 )
-                pp_peer_rank = (RANK + TP_WORLD_SIZE) if (RANK < TP_WORLD_SIZE) else (RANK - TP_WORLD_SIZE)
-                pp_ranks = [RANK, pp_peer_rank]
-                pp_ranks.sort()
-                pp_group = torch.distributed.new_group(
-                    rank=pp_ranks, 
-                    timeout=timedelta(seconds=60), 
-                    backend=backend, 
-                    pg_options=options,
-                )
+
+                # For PP=2, who need pp_group: 
+                # (a) The "Master Rank"(RANK=0) in FIRST part, used to do broadcast
+                # (b) All ranks in LAST part, used to receive tensors sent from broadcast
+                if RANK == 0 or RANK >= TP_WORLD_SIZE:
+                    pp_ranks = [rank for rank in range(WORLD_SIZE) if rank == 0 or rank >= TP_WORLD_SIZE]
+                    pp_group = torch.distributed.new_group(ranks=pp_ranks, 
+                                                           timeout=timedelta(seconds=60), 
+                                                           backend=backend, 
+                                                           pg_options=options,)
+                else:
+                    pp_group = None
                 return torch.distributed.group.WORLD, tp_group, pp_group, RANK, WORLD_SIZE, TP_WORLD_SIZE, PP_WORLD_SIZE
+            else:
+                raise f"Only Support PP_WORLD_SIZE == 2"
         else:
             raise "torch.distributed is already initialized."
         

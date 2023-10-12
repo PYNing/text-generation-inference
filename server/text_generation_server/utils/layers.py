@@ -277,14 +277,14 @@ class SuperLayer(nn.Module):
 
 
 class TensorParallelHead(SuperLayer):
-    def __init__(self, linear, process_group, should_gather: bool):
+    def __init__(self, linear, tp_group, should_gather: bool):
         super().__init__(linear)
-        self.process_group = process_group
+        self.tp_group = tp_group
         self.should_gather = should_gather
 
     @staticmethod
     def load(config, prefix: str, weights):
-        if weights.process_group.size() > 1:
+        if weights.tp_group.size() > 1:
             try:
                 weight = weights.get_sharded(f"{prefix}.weight", dim=0)
                 should_gather = True
@@ -304,7 +304,7 @@ class TensorParallelHead(SuperLayer):
             quantize = config.quantize
         return TensorParallelHead(
             get_linear(weight, bias=None, quantize=quantize),
-            process_group=weights.process_group,
+            tp_group=weights.tp_group,
             should_gather=should_gather,
         )
 
@@ -312,23 +312,23 @@ class TensorParallelHead(SuperLayer):
         if not self.should_gather:
             return super().forward(input)
 
-        world_size = self.process_group.size()
+        tp_world_size = self.tp_group.size()
         if len(input.shape) == 2 and isinstance(self.linear, FastLinear):
             out_dim = self.linear.weight.shape[0]
 
             if input.shape[0] == 1:
-                world_out = input.new_empty(1, out_dim * world_size)
+                world_out = input.new_empty(1, out_dim * tp_world_size)
                 local_out = input.new_empty(1, out_dim)
                 gather_input = local_out
             else:
-                world_out = input.new_empty(out_dim * world_size, input.shape[0])
+                world_out = input.new_empty(out_dim * tp_world_size, input.shape[0])
                 gather_input = input.new_empty(out_dim, input.shape[0])
                 local_out = gather_input.T
 
             torch.mm(input, self.linear.weight.T, out=local_out)
 
             torch.distributed.all_gather_into_tensor(
-                world_out, gather_input, group=self.process_group
+                world_out, gather_input, group=self.tp_group
             )
 
             if input.shape[0] == 1:
@@ -337,9 +337,9 @@ class TensorParallelHead(SuperLayer):
 
         output = super().forward(input)
         world_output = [
-            torch.empty_like(output) for _ in range(self.process_group.size())
+            torch.empty_like(output) for _ in range(self.tp_group.size())
         ]
-        torch.distributed.all_gather(world_output, output, group=self.process_group)
+        torch.distributed.all_gather(world_output, output, group=self.tp_group)
         world_output = torch.cat(world_output, dim=-1)
         return world_output
 
@@ -378,29 +378,53 @@ class TensorParallelColumnLinear(SuperLayer):
 
 
 class TensorParallelRowLinear(SuperLayer):
-    def __init__(self, linear, process_group):
+    def __init__(self, linear, tp_group, pp_group, is_master_rank, pp=1, send_to_next_stage=False):
         super().__init__(linear)
-        self.process_group = process_group
+        self.tp_group = tp_group
+        self.pp_group = pp_group
+        self.send_to_next_stage = send_to_next_stage
+        self.pp = pp
+        self.is_master_rank = is_master_rank
 
     @classmethod
-    def load(cls, config, prefix: str, weights, bias: bool):
+    def load(cls, config, prefix: str, weights, bias: bool, send_to_next_stage: bool=False):
         weight = weights.get_multi_weights_row(prefix, quantize=config.quantize)
 
-        if bias and weights.process_group.rank() == 0:
+        pp = weights.process_group.size() // weights.tp_group.size()
+        assert pp == 1 or pp == 2, "Only support No PP, or PP=2"
+        if send_to_next_stage:
+            assert pp > 1
+        is_master_rank = weights.process_group.rank() == 0
+        if bias and is_master_rank:
             # Rank is only on the first rank process
             bias = weights.get_tensor(f"{prefix}.bias")
         else:
             bias = None
         return cls(
             get_linear(weight, bias, config.quantize),
-            process_group=weights.process_group,
+            tp_group=weights.tp_group,
+            pp_group=weights.pp_group,
+            is_master_rank=is_master_rank,
+            pp = pp,
+            send_to_next_stage=send_to_next_stage,
         )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = super().forward(input)
-        if self.process_group.size() > 1:
-            torch.distributed.all_reduce(out, group=self.process_group)
-        return out
+        if not self.send_to_next_stage:
+            if self.tp_group.size() > 1:
+                torch.distributed.all_reduce(out, group=self.tp_group)
+                return out
+        elif self.pp == 2:
+            MASTER_RANK = 0 # For PP=2
+            # do reduce whthin tp_grup            
+            torch.distributed.reduce(out, MASTER_RANK, group = self.tp_group)
+            if self.is_master_rank:
+                # do broadcast whin pp_group
+                torch.distributed.broadcast(out, MASTER_RANK, group = self.pp_group)
+            return None # "out" should no longer be used in this case
+        else:
+            raise NotImplemented
 
 
 class TensorParallelEmbedding(nn.Module):
@@ -410,15 +434,17 @@ class TensorParallelEmbedding(nn.Module):
         num_embeddings = weights.get_shape(f"{prefix}.weight")[0]
 
         process_group = weights.process_group
+        tp_group = weights.tp_group
 
-        world_size = process_group.size()
+        tp_world_size = tp_group.size()
         rank = process_group.rank()
+        tp_rank = rank % tp_world_size
 
-        block_size = num_embeddings // world_size
-        self.min_id = rank * block_size
-        self.max_id = min(num_embeddings, (rank + 1) * block_size)
+        block_size = num_embeddings // tp_world_size
+        self.min_id = tp_rank * block_size
+        self.max_id = min(num_embeddings, (tp_rank + 1) * block_size)
         self.null_idx = block_size
-        self.process_group = weights.process_group
+        self.tp_group = weights.tp_group
         self.reduce = reduce
 
         """Additional 0 entry used for masking"""
@@ -433,8 +459,8 @@ class TensorParallelEmbedding(nn.Module):
             input - self.min_id,
         )
         out = torch.nn.functional.embedding(input, self.weight)
-        if self.reduce and self.process_group.size() > 1:
-            torch.distributed.all_reduce(out, group=self.process_group)
+        if self.reduce and self.tp_group.size() > 1:
+            torch.distributed.all_reduce(out, group=self.tp_group)
         return out
 
 

@@ -69,7 +69,7 @@ class FlashLlama(FlashCausalLM):
         torch.distributed.barrier(group=self.process_group)
 
         filenames = weight_files(model_id, revision=revision, extension=".safetensors")
-        weights = Weights(filenames, device, dtype, process_group=self.process_group, tp_group=self.tp_group)
+        weights = Weights(filenames, device, dtype, process_group=self.process_group, tp_group=self.tp_group, pp_group=self.pp_group)
         if config.quantize == "gptq":
             weights._set_gptq_params(model_id)
         elif config.quantize == "awq":
