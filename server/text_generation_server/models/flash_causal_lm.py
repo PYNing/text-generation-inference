@@ -718,6 +718,8 @@ class FlashCausalLM(Model):
         device: torch.device,
         rank: int = 0,
         world_size: int = 1,
+        tp_world_size: int = None,
+        pp_world_size: int = None,
     ):
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -731,6 +733,8 @@ class FlashCausalLM(Model):
             device=device,
             rank=rank,
             world_size=world_size,
+            tp_world_size=tp_world_size,
+            pp_world_size=pp_world_size,
         )
 
     @property
@@ -1005,6 +1009,7 @@ class FlashCausalLM(Model):
 
             # Shard generations
             # All generations will be appended in the rust sharded client
+            # NNPPYY
             if i % self.world_size == self.rank:
                 if stop:
                     # Decode generated tokens

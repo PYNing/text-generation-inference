@@ -439,6 +439,7 @@ fn shard_manager(
     // Torch Distributed Env vars
     envs.push(("RANK".into(), rank.to_string().into()));
     envs.push(("WORLD_SIZE".into(), world_size.to_string().into()));
+    // TODO(ningpeiyang): set PP_WORLD_SIZE
     envs.push(("MASTER_ADDR".into(), master_addr.into()));
     envs.push(("MASTER_PORT".into(), master_port.to_string().into()));
     envs.push(("NCCL_ASYNC_ERROR_HANDLING".into(), "1".into()));
@@ -848,6 +849,7 @@ fn spawn_shards(
     running: Arc<AtomicBool>,
 ) -> Result<(), LauncherError> {
     // Start shard processes
+    // NNPPYY
     for rank in 0..num_shard {
         let model_id = args.model_id.clone();
         let revision = args.revision.clone();
@@ -878,7 +880,7 @@ fn spawn_shards(
                 trust_remote_code,
                 uds_path,
                 rank,
-                num_shard,
+                num_shard, // word_size
                 master_addr,
                 master_port,
                 huggingface_hub_cache,

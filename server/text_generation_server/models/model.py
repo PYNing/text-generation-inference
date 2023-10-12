@@ -21,6 +21,8 @@ class Model(ABC):
         device: torch.device,
         rank: int = 0,
         world_size: int = 1,
+        tp_world_size: int = None,
+        pp_world_size: int = None,
     ):
         self.model = model.eval()
         self.tokenizer = tokenizer
@@ -30,6 +32,8 @@ class Model(ABC):
         self.device = device
         self.rank = rank
         self.world_size = world_size
+        self.tp_world_size = tp_world_size if tp_world_size is not None else world_size
+        self.pp_world_size = pp_world_size if pp_world_size is not None else 1
 
         self.has_position_ids = (
             inspect.signature(model.forward).parameters.get("position_ids", None)

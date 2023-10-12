@@ -15,6 +15,7 @@ class Weights:
         device,
         dtype,
         process_group,
+        tp_group = None,
         aliases: Optional[Dict[str, List[str]]] = None,
     ):
         routing = {}
@@ -33,6 +34,7 @@ class Weights:
         self.device = device
         self.dtype = dtype
         self.process_group = process_group
+        self.tp_group = tp_group if tp_group is not None else self.process_group
         self._handles = {}
 
     def _get_handle(self, filename):
@@ -78,13 +80,14 @@ class Weights:
         filename, tensor_name = self.get_filename(tensor_name)
         f = self._get_handle(filename)
         slice_ = f.get_slice(tensor_name)
-        world_size = self.process_group.size()
+        tp_world_size = self.tp_group.size()
         rank = self.process_group.rank()
+        tp_rank = rank % tp_world_size
 
         size = slice_.get_shape()[dim]
-        block_size = size // world_size
-        start = rank * block_size
-        stop = (rank + 1) * block_size
+        block_size = size // tp_world_size
+        start = tp_rank * block_size
+        stop = (tp_rank + 1) * block_size
 
         if dim == 0:
             tensor = slice_[start:stop]
@@ -104,10 +107,11 @@ class Weights:
         f = self._get_handle(filename)
         slice_ = f.get_slice(tensor_name)
         world_size = self.process_group.size()
+        tp_world_size = self.tp_group.size()
         size = slice_.get_shape()[dim]
         assert (
-            size % world_size == 0
-        ), f"The choosen size {size} is not compatible with sharding on {world_size} shards"
+            size % tp_world_size == 0
+        ), f"The choosen size {size} is not compatible with sharding on {tp_world_size} shards while WORLD_SIZE={world_size}, TP_WORLD_SIZE={tp_world_size}"
         return self.get_partial_sharded(tensor_name, dim)
 
 
@@ -117,12 +121,14 @@ class Weights:
         assert total_size % 3 == 0, "Prepacked quantized qkv is not divisible by 3"
         single_size = total_size // 3
         world_size = self.process_group.size()
+        tp_world_size = self.tp_group.size()
         rank = self.process_group.rank()
+        tp_rank = rank % tp_world_size
 
-        assert single_size % world_size == 0, f"Prepacked quantized qkv cannot be sharded across {world_size} shards"
-        block_size = single_size // world_size
-        start = rank * block_size
-        stop = (rank + 1) * block_size
+        assert single_size % tp_world_size == 0, f"Prepacked quantized qkv cannot be sharded across {tp_world_size} shards while WORLD_SIZE={world_size}, TP_WORLD_SIZE={tp_world_size}"
+        block_size = single_size // tp_world_size
+        start = tp_rank * block_size
+        stop = (tp_rank + 1) * block_size
         q = slice_[:, start:stop]
         k = slice_[:, start+single_size:stop+single_size]
         v = slice_[:, start+2*single_size:stop+2*single_size]
@@ -169,12 +175,14 @@ class Weights:
             assert total_size % 3 == 0, "Prepacked qkv is not divisible by 3"
             single_size = total_size // 3
             world_size = self.process_group.size()
+            tp_world_size = self.tp_group.size()
             rank = self.process_group.rank()
+            tp_rank = rank % tp_world_size
 
-            assert single_size % world_size == 0, f"Prepacked qkv cannot be sharded across {world_size} shards"
-            block_size = single_size // world_size
-            start = rank * block_size
-            stop = (rank + 1) * block_size
+            assert single_size % tp_world_size == 0, f"Prepacked qkv cannot be sharded across {world_size} shards, while WORLD_SIZE={world_size}, TP_WORLD_SIZE={tp_world_size}"
+            block_size = single_size // tp_world_size
+            start = tp_rank * block_size
+            stop = (tp_rank + 1) * block_size
             q = slice_[start:stop]
             k = slice_[start+single_size:stop+single_size]
             v = slice_[start+2*single_size:stop+2*single_size]
@@ -233,10 +241,12 @@ class Weights:
     
     def get_tensor_shard(self, var, dim):
         world_size = self.process_group.size()
+        tp_world_size = self.tp_group.size()
         rank = self.process_group.rank()
-        block_size = var.size()[dim] // world_size
-        start = rank * block_size
-        stop = (rank + 1) * block_size
+        tp_rank = rank % tp_world_size
+        block_size = var.size()[dim] // tp_world_size
+        start = tp_rank * block_size
+        stop = (tp_rank + 1) * block_size
         if dim == 0:
             tensor = var[start:stop]
         elif dim == 1:

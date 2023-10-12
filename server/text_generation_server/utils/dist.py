@@ -7,6 +7,7 @@ from loguru import logger
 # Tensor Parallelism settings
 RANK = int(os.getenv("RANK", "0"))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
+PP_WORLD_SIZE = int(os.getenv("PP_WORLD_SIZE", "1"))
 
 # CUDA memory fraction
 MEMORY_FRACTION = float(os.getenv("CUDA_MEMORY_FRACTION", "1.0"))
@@ -60,11 +61,14 @@ def initialize_torch_distributed():
         backend = "gloo"
         options = None
 
+    # Return: Total_Group, TP_Group, PP_Group, RANK, WORLD_SIZE, TP_WORLD_SIZE, PP_WORLD_SIZE
     if WORLD_SIZE == 1:
-        return FakeGroup(RANK, WORLD_SIZE), RANK, WORLD_SIZE
+        assert WORLD_SIZE == PP_WORLD_SIZE, f"WORLD_SIZE(which is {WORLD_SIZE}) is not equal to PP_WORLD_SIZE(which is {PP_WORLD_SIZE})"
+        TP_WORLD_SIZE = WORLD_SIZE
+        return FakeGroup(RANK, WORLD_SIZE), FakeGroup(RANK, TP_WORLD_SIZE), None, RANK, WORLD_SIZE, TP_WORLD_SIZE, PP_WORLD_SIZE
     else:
         if os.getenv("DEBUG", None) == "1":
-            return FakeGroup(RANK, WORLD_SIZE), RANK, WORLD_SIZE
+            raise NotImplementedError
 
         if not torch.distributed.is_initialized():
             # Call the init process.
@@ -75,7 +79,32 @@ def initialize_torch_distributed():
                 timeout=timedelta(seconds=60),
                 pg_options=options,
             )
-        else:
-            logger.warning("torch.distributed is already initialized.")
 
-        return torch.distributed.group.WORLD, RANK, WORLD_SIZE
+            if PP_WORLD_SIZE == 1: 
+                TP_WORLD_SIZE = WORLD_SIZE
+                return torch.distributed.group.WORLD, torch.distributed.group.WORLD, None, RANK, WORLD_SIZE, TP_WORLD_SIZE, PP_WORLD_SIZE
+            else:
+                assert PP_WORLD_SIZE == 2, f"Only Support PP_WORLD_SIZE == 2"
+                assert WORLD_SIZE % PP_WORLD_SIZE == 0, f"WORLD_SIZE(which is {WORLD_SIZE}) is not divisible by PP_WORLD_SIZE(which is {PP_WORLD_SIZE})"
+                TP_WORLD_SIZE = WORLD_SIZE // PP_WORLD_SIZE
+                tp_begin_rank = RANK // TP_WORLD_SIZE * TP_WORLD_SIZE
+                tp_ranks = [tp_begin_rank + i for i in range(tp_begin_rank)]
+                tp_group = torch.distributed.new_group(
+                    rank=tp_ranks, 
+                    timeout=timedelta(seconds=60), 
+                    backend=backend, 
+                    pg_options=options,
+                )
+                pp_peer_rank = (RANK + TP_WORLD_SIZE) if (RANK < TP_WORLD_SIZE) else (RANK - TP_WORLD_SIZE)
+                pp_ranks = [RANK, pp_peer_rank]
+                pp_ranks.sort()
+                pp_group = torch.distributed.new_group(
+                    rank=pp_ranks, 
+                    timeout=timedelta(seconds=60), 
+                    backend=backend, 
+                    pg_options=options,
+                )
+                return torch.distributed.group.WORLD, tp_group, pp_group, RANK, WORLD_SIZE, TP_WORLD_SIZE, PP_WORLD_SIZE
+        else:
+            raise "torch.distributed is already initialized."
+        

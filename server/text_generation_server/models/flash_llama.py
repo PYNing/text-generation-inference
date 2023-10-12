@@ -29,7 +29,15 @@ class FlashLlama(FlashCausalLM):
         dtype: Optional[torch.dtype] = None,
         trust_remote_code: bool = False,
     ):
-        self.process_group, rank, world_size = initialize_torch_distributed()
+        (
+            self.process_group,
+            self.tp_group,
+            self.pp_group,
+            rank,
+            world_size,
+            tp_world_size,
+            pp_world_size,
+        ) = initialize_torch_distributed()
         if torch.cuda.is_available():
             device = torch.device(f"cuda:{rank}")
             dtype = torch.float16 if dtype is None else dtype
@@ -61,7 +69,7 @@ class FlashLlama(FlashCausalLM):
         torch.distributed.barrier(group=self.process_group)
 
         filenames = weight_files(model_id, revision=revision, extension=".safetensors")
-        weights = Weights(filenames, device, dtype, process_group=self.process_group)
+        weights = Weights(filenames, device, dtype, process_group=self.process_group, tp_group=self.tp_group)
         if config.quantize == "gptq":
             weights._set_gptq_params(model_id)
         elif config.quantize == "awq":
