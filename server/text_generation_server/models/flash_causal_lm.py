@@ -854,6 +854,12 @@ class FlashCausalLM(Model):
             del batch
             raise e
 
+        # Results
+        generations: List[Generation] = []        
+        if self.pp_world_size > 1 and out is None:
+            # "out" is None means it's not final output, return empty respone
+            return generations, None
+
         if prefill:
             next_token_logits = (
                 out[batch.prefill_next_token_indices] if prefill_logprobs else out
@@ -885,10 +891,6 @@ class FlashCausalLM(Model):
 
         # Cumulative length
         cumulative_length = 0
-
-        # Results
-        generations: List[Generation] = []
-        stopped = True
 
         # Zipped iterator
         iterator = zip(
@@ -973,6 +975,7 @@ class FlashCausalLM(Model):
         )
 
         # For each member of the batch
+        stopped = True
         for i, (
             request,
             input_length,
@@ -1009,8 +1012,7 @@ class FlashCausalLM(Model):
 
             # Shard generations
             # All generations will be appended in the rust sharded client
-            # NNPPYY
-            if i % self.world_size == self.rank:
+            if (i % self.tp_world_size) == (self.rank % self.tp_world_size):
                 if stop:
                     # Decode generated tokens
                     output_text = self.decode(
