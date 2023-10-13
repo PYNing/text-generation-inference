@@ -16,7 +16,6 @@ class Weights:
         dtype,
         process_group,
         tp_group = None,
-        pp_group = None,
         aliases: Optional[Dict[str, List[str]]] = None,
     ):
         routing = {}
@@ -36,7 +35,6 @@ class Weights:
         self.dtype = dtype
         self.process_group = process_group
         self.tp_group = tp_group if tp_group is not None else self.process_group
-        self.pp_group = pp_group
         self._handles = {}
 
     def _get_handle(self, filename):

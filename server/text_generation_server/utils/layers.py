@@ -378,22 +378,14 @@ class TensorParallelColumnLinear(SuperLayer):
 
 
 class TensorParallelRowLinear(SuperLayer):
-    def __init__(self, linear, tp_group, pp_group, is_master_rank, pp=1, send_to_next_stage=False):
+    def __init__(self, linear, tp_group, do_all_reduce=True):
         super().__init__(linear)
         self.tp_group = tp_group
-        self.pp_group = pp_group
-        self.send_to_next_stage = send_to_next_stage
-        self.pp = pp
-        self.is_master_rank = is_master_rank
+        self.do_all_reduce = do_all_reduce
 
     @classmethod
-    def load(cls, config, prefix: str, weights, bias: bool, send_to_next_stage: bool=False):
+    def load(cls, config, prefix: str, weights, bias: bool, do_all_reduce: bool=True):
         weight = weights.get_multi_weights_row(prefix, quantize=config.quantize)
-
-        pp = weights.process_group.size() // weights.tp_group.size()
-        assert pp == 1 or pp == 2, "Only support No PP, or PP=2"
-        if send_to_next_stage:
-            assert pp > 1
         is_master_rank = weights.process_group.rank() == 0
         if bias and is_master_rank:
             # Rank is only on the first rank process
@@ -403,28 +395,16 @@ class TensorParallelRowLinear(SuperLayer):
         return cls(
             get_linear(weight, bias, config.quantize),
             tp_group=weights.tp_group,
-            pp_group=weights.pp_group,
-            is_master_rank=is_master_rank,
-            pp = pp,
-            send_to_next_stage=send_to_next_stage,
+            do_all_reduce=do_all_reduce,
         )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = super().forward(input)
-        if not self.send_to_next_stage:
-            if self.tp_group.size() > 1:
-                torch.distributed.all_reduce(out, group=self.tp_group)
-                return out
-        elif self.pp == 2:
-            MASTER_RANK = 0 # For PP=2
-            # do reduce whthin tp_grup            
-            torch.distributed.reduce(out, MASTER_RANK, group = self.tp_group)
-            if self.is_master_rank:
-                # do broadcast whin pp_group
-                torch.distributed.broadcast(out, MASTER_RANK, group = self.pp_group)
-            return None # "out" should no longer be used in this case
+        if self.do_all_reduce and self.tp_group.size() > 1:
+            torch.distributed.all_reduce(out, group=self.tp_group)
+            return out
         else:
-            raise NotImplemented
+            return out
 
 
 class TensorParallelEmbedding(nn.Module):

@@ -305,7 +305,7 @@ class FlashLlamaAttention(torch.nn.Module):
 
 
 class LlamaMLP(nn.Module):
-    def __init__(self, prefix, config, weights):
+    def __init__(self, prefix, config, weights, ffn_do_all_reduce=True):
         super().__init__()
         act = config.hidden_act
         self.act = (
@@ -331,6 +331,7 @@ class LlamaMLP(nn.Module):
             prefix=f"{prefix}.down_proj",
             weights=weights,
             bias=False,
+            do_all_reduce=ffn_do_all_reduce,
         )
         self.intermediate_size = (
             config.intermediate_size // weights.tp_group.size()
@@ -343,13 +344,13 @@ class LlamaMLP(nn.Module):
 
 
 class FlashLlamaLayer(nn.Module):
-    def __init__(self, layer_id, config, weights):
+    def __init__(self, layer_id, config, weights, ffn_do_all_reduce=True):
         super().__init__()
         prefix = f"model.layers.{layer_id}"
         self.self_attn = FlashLlamaAttention(
             prefix=f"{prefix}.self_attn", config=config, weights=weights
         )
-        self.mlp = LlamaMLP(prefix=f"{prefix}.mlp", config=config, weights=weights)
+        self.mlp = LlamaMLP(prefix=f"{prefix}.mlp", config=config, weights=weights, ffn_do_all_reduce=ffn_do_all_reduce)
 
         self.input_layernorm = LlamaRMSNorm(
             prefix=f"{prefix}.input_layernorm", weights=weights, eps=config.rms_norm_eps
@@ -466,6 +467,135 @@ class FlashLlamaModel(torch.nn.Module):
 
         return hidden_states
 
+class FlashLlamaModel_PP2_Stage0(torch.nn.Module):
+    def __init__(self, config, weights):
+        super().__init__()
+
+        process_group = weights.process_group
+        self.rank = process_group.rank()
+        self.world_size = process_group.size()
+        self.embed_tokens = TensorParallelEmbedding(
+            prefix="model.embed_tokens", weights=weights
+        )
+        stage0_end_layer_id = config.num_hidden_layers // 2 - 1
+        self.layers = nn.ModuleList(
+            [
+                FlashLlamaLayer(
+                    layer_id=layer_id,
+                    config=config,
+                    weights=weights,
+                    ffn_do_all_reduce= layer_id < stage0_end_layer_id
+                )
+                for layer_id in range(stage0_end_layer_id + 1)
+            ]
+        )
+
+        self.gradient_checkpointing = False
+
+        self.head_size = self.layers[0].self_attn.head_size
+        self.num_heads = self.layers[0].self_attn.num_heads
+        self.num_key_value_heads = self.layers[0].self_attn.num_key_value_heads
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        cu_seqlen_prefill: Optional[torch.Tensor],
+        kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
+        block_tables: torch.Tensor,
+        slots: torch.Tensor,
+        input_lengths: torch.Tensor,
+        max_s: int,
+    ) -> torch.Tensor:
+        hidden_states = self.embed_tokens(input_ids)
+
+        # Get rotary cos and sin for this forward
+        # Avoid to index in each layer
+        cos, sin = self.layers[0].self_attn.rotary_emb.get_cos_sin(
+            position_ids, max_s, hidden_states.dtype
+        )
+
+        residual = None
+        for i, layer in enumerate(self.layers):
+            hidden_states, residual = layer(
+                hidden_states,
+                residual,
+                cos,
+                sin,
+                cu_seqlen_prefill,
+                kv_cache[i],
+                block_tables,
+                slots,
+                input_lengths,
+                max_s,
+            )
+
+        return None
+
+class FlashLlamaModel_PP2_Stage1(torch.nn.Module):
+    def __init__(self, config, weights):
+        super().__init__()
+
+        process_group = weights.process_group
+        self.rank = process_group.rank()
+        self.world_size = process_group.size()
+
+        stage1_start_layer_id = config.num_hidden_layers // 2
+        self.layers = nn.ModuleList(
+            [
+                FlashLlamaLayer(
+                    layer_id,
+                    config,
+                    weights,
+                )
+                for layer_id in range(stage1_start_layer_id, config.num_hidden_layers)
+            ]
+        )
+        self.norm = LlamaRMSNorm(
+            prefix="model.norm", weights=weights, eps=config.rms_norm_eps
+        )
+
+        self.gradient_checkpointing = False
+
+        self.head_size = self.layers[0].self_attn.head_size
+        self.num_heads = self.layers[0].self_attn.num_heads
+        self.num_key_value_heads = self.layers[0].self_attn.num_key_value_heads
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        cu_seqlen_prefill: Optional[torch.Tensor],
+        kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
+        block_tables: torch.Tensor,
+        slots: torch.Tensor,
+        input_lengths: torch.Tensor,
+        max_s: int,
+    ) -> torch.Tensor:
+        # Get rotary cos and sin for this forward
+        # Avoid to index in each layer
+        cos, sin = self.layers[0].self_attn.rotary_emb.get_cos_sin(
+            position_ids, max_s, hidden_states.dtype
+        )
+
+        residual = None
+        for i, layer in enumerate(self.layers):
+            hidden_states, residual = layer(
+                hidden_states,
+                residual,
+                cos,
+                sin,
+                cu_seqlen_prefill,
+                kv_cache[i],
+                block_tables,
+                slots,
+                input_lengths,
+                max_s,
+            )
+
+        hidden_states, _ = self.norm(hidden_states, residual)
+
+        return hidden_states
 
 class FlashLlamaForCausalLM(torch.nn.Module):
     def __init__(self, config, weights):
@@ -504,3 +634,74 @@ class FlashLlamaForCausalLM(torch.nn.Module):
             hidden_states = hidden_states[lm_head_indices]
         logits = self.lm_head(hidden_states)
         return logits
+
+class FlashLlamaForCausalLM_PP2(torch.nn.Module):
+    def __init__(self, config, weights, stage):
+        super().__init__()
+
+        self.stage = stage
+        if self.stage == 0:
+            self.model = FlashLlamaModel_PP2_Stage0(config, weights)
+        elif self.stage == 1:
+            self.hidden_size = config.hidden_size
+            self.model = FlashLlamaModel_PP2_Stage1(config, weights)
+            self.lm_head = TensorParallelHead.load(
+                config,
+                prefix="lm_head",
+                weights=weights,
+            )
+        else:
+            raise NotImplementedError
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        cu_seqlen_prefill: Optional[torch.Tensor],
+        kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
+        block_tables: torch.Tensor,
+        slots: torch.Tensor,
+        input_lengths: torch.Tensor,
+        max_s: int,
+        lm_head_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.stage == 0:
+            hidden_states = self.model(
+                input_ids,
+                position_ids,
+                cu_seqlen_prefill,
+                kv_cache,
+                block_tables,
+                slots,
+                input_lengths,
+                max_s,
+            )
+            MASTER_RANK = 0 # For PP=2
+            # do reduce whthin tp_grup            
+            torch.distributed.reduce(hidden_states, MASTER_RANK, group = self.tp_group)
+            if self.process_group.rank() == MASTER_RANK:
+                # do broadcast whin pp_group
+                torch.distributed.broadcast(hidden_states, MASTER_RANK, group = self.pp_group)
+            return None # "hidden_states" should no longer be used in this case
+        elif self.stage == 1:
+            MASTER_RANK = 0 # For PP=2
+            hidden_states = torch.empty(input_ids.shape[0], self.hidden_size, device=input_ids.deivce)
+            torch.distributed.broadcast(hidden_states, MASTER_RANK, group = self.pp_group)
+
+            hidden_states = self.model(
+                hidden_states,
+                position_ids,
+                cu_seqlen_prefill,
+                kv_cache,
+                block_tables,
+                slots,
+                input_lengths,
+                max_s,
+            )
+            if lm_head_indices is not None:
+                hidden_states = hidden_states[lm_head_indices]
+            logits = self.lm_head(hidden_states)
+            return logits
+        else:
+            raise NotImplementedError
+    

@@ -9,6 +9,7 @@ from typing import Optional
 from text_generation_server.models import FlashCausalLM
 from text_generation_server.models.custom_modeling.flash_llama_modeling import (
     FlashLlamaForCausalLM,
+    FlashLlamaForCausalLM_PP2,
     LlamaConfig,
 )
 from text_generation_server.utils import (
@@ -69,13 +70,19 @@ class FlashLlama(FlashCausalLM):
         torch.distributed.barrier(group=self.process_group)
 
         filenames = weight_files(model_id, revision=revision, extension=".safetensors")
-        weights = Weights(filenames, device, dtype, process_group=self.process_group, tp_group=self.tp_group, pp_group=self.pp_group)
+        weights = Weights(filenames, device, dtype, process_group=self.process_group, tp_group=self.tp_group)
         if config.quantize == "gptq":
             weights._set_gptq_params(model_id)
         elif config.quantize == "awq":
             weights._set_awq_params(model_id)
 
-        model = FlashLlamaForCausalLM(config, weights)
+        if pp_world_size == 1:
+            model = FlashLlamaForCausalLM(config, weights)
+        elif pp_world_size == 2:
+            stage = 0 if rank < tp_world_size else 1
+            model = FlashLlamaForCausalLM_PP2(config, weights, stage)
+        else:
+            raise NotImplementedError("Support No PP or PP=2 only")
 
         torch.distributed.barrier(group=self.process_group)
         super(FlashLlama, self).__init__(
