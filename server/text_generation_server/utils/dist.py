@@ -79,6 +79,7 @@ def initialize_torch_distributed():
                 timeout=timedelta(seconds=60),
                 pg_options=options,
             )
+            torch.distributed.barrier(group=torch.distributed.group.WORLD)
 
             if PP_WORLD_SIZE == 1: 
                 TP_WORLD_SIZE = WORLD_SIZE
@@ -87,25 +88,26 @@ def initialize_torch_distributed():
                 assert WORLD_SIZE % PP_WORLD_SIZE == 0, f"WORLD_SIZE(which is {WORLD_SIZE}) is not divisible by PP_WORLD_SIZE(which is {PP_WORLD_SIZE})"
                 TP_WORLD_SIZE = WORLD_SIZE // PP_WORLD_SIZE
                 tp_begin_rank = RANK // TP_WORLD_SIZE * TP_WORLD_SIZE
-                tp_ranks = [tp_begin_rank + i for i in range(tp_begin_rank)]
+                tp_ranks = [tp_begin_rank + i for i in range(TP_WORLD_SIZE)]
                 tp_group = torch.distributed.new_group(
                     ranks=tp_ranks, 
                     timeout=timedelta(seconds=60), 
                     backend=backend, 
                     pg_options=options,
                 )
+                torch.distributed.barrier(group=torch.distributed.group.WORLD)
 
                 # For PP=2, who need pp_group: 
                 # (a) The "Master Rank"(RANK=0) in FIRST part, used to do broadcast
                 # (b) All ranks in LAST part, used to receive tensors sent from broadcast
-                if RANK == 0 or RANK >= TP_WORLD_SIZE:
-                    pp_ranks = [rank for rank in range(WORLD_SIZE) if rank == 0 or rank >= TP_WORLD_SIZE]
-                    pp_group = torch.distributed.new_group(ranks=pp_ranks, 
-                                                           timeout=timedelta(seconds=60), 
-                                                           backend=backend, 
-                                                           pg_options=options,)
-                else:
-                    pp_group = None
+                # WARNING: all processes (even not in 'pp_group') should execute the following logic, otherwise hang will be encountered
+                pp_ranks = [rank for rank in range(WORLD_SIZE) if rank == 0 or rank >= TP_WORLD_SIZE]
+                pp_group = torch.distributed.new_group(ranks=pp_ranks, 
+                                                       timeout=timedelta(seconds=60), 
+                                                       backend=backend, 
+                                                       pg_options=options,)
+                torch.distributed.barrier(group=torch.distributed.group.WORLD)
+                
                 return torch.distributed.group.WORLD, tp_group, pp_group, RANK, WORLD_SIZE, TP_WORLD_SIZE, PP_WORLD_SIZE
             else:
                 raise f"Only Support PP_WORLD_SIZE == 2"
