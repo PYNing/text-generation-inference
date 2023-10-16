@@ -530,7 +530,7 @@ class FlashLlamaModel_PP2_Stage0(torch.nn.Module):
                 max_s,
             )
 
-        return None
+        return hidden_states
 
 class FlashLlamaModel_PP2_Stage1(torch.nn.Module):
     def __init__(self, config, weights):
@@ -636,10 +636,12 @@ class FlashLlamaForCausalLM(torch.nn.Module):
         return logits
 
 class FlashLlamaForCausalLM_PP2(torch.nn.Module):
-    def __init__(self, config, weights, stage):
+    def __init__(self, config, weights, stage, tp_group, pp_group):
         super().__init__()
 
         self.stage = stage
+        self.tp_group = tp_group
+        self.pp_group = pp_group
         if self.stage == 0:
             self.model = FlashLlamaModel_PP2_Stage0(config, weights)
         elif self.stage == 1:
@@ -677,16 +679,21 @@ class FlashLlamaForCausalLM_PP2(torch.nn.Module):
                 max_s,
             )
             MASTER_RANK = 0 # For PP=2
-            # do reduce whthin tp_grup            
+            # do reduce whthin tp_group
             torch.distributed.reduce(hidden_states, MASTER_RANK, group = self.tp_group)
-            if self.process_group.rank() == MASTER_RANK:
-                # do broadcast whin pp_group
-                torch.distributed.broadcast(hidden_states, MASTER_RANK, group = self.pp_group)
+            # Note(ningpeiyang): why do synchronize, see WARNING at https://pytorch.org/docs/stable/distributed.html#groups
+            torch.cuda.synchronize()
+
+            # do broadcast whin pp_group
+            # NOTE(ningpeiyang): op will be ignored if current rank not in 'pp_group'
+            torch.distributed.broadcast(hidden_states, MASTER_RANK, group = self.pp_group)
             return None # "hidden_states" should no longer be used in this case
         elif self.stage == 1:
             MASTER_RANK = 0 # For PP=2
-            hidden_states = torch.empty(input_ids.shape[0], self.hidden_size, device=input_ids.deivce)
+            hidden_states = torch.empty(input_ids.shape[0], self.hidden_size, device=input_ids.device, dtype=torch.float16)
             torch.distributed.broadcast(hidden_states, MASTER_RANK, group = self.pp_group)
+            # NOTE(ningpeiyang): why do synchronize, see WARNING at https://pytorch.org/docs/stable/distributed.html#groups
+            torch.cuda.synchronize()
 
             hidden_states = self.model(
                 hidden_states,
