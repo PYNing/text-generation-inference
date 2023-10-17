@@ -680,20 +680,16 @@ class FlashLlamaForCausalLM_PP2(torch.nn.Module):
             )
             MASTER_RANK = 0 # For PP=2
             # do reduce whthin tp_group
-            torch.distributed.reduce(hidden_states, MASTER_RANK, group = self.tp_group)
-            # Note(ningpeiyang): why do synchronize, see WARNING at https://pytorch.org/docs/stable/distributed.html#groups
-            torch.cuda.synchronize()
-
+            torch.distributed.reduce(hidden_states, MASTER_RANK, group=self.tp_group)
             # do broadcast whin pp_group
             # NOTE(ningpeiyang): op will be ignored if current rank not in 'pp_group'
-            torch.distributed.broadcast(hidden_states, MASTER_RANK, group = self.pp_group)
-            return None # "hidden_states" should no longer be used in this case
+            torch.distributed.broadcast(hidden_states, MASTER_RANK, group=self.pp_group)
+            # "hidden_states" should no longer be used in this case
+            return None
         elif self.stage == 1:
             MASTER_RANK = 0 # For PP=2
             hidden_states = torch.empty(input_ids.shape[0], self.hidden_size, device=input_ids.device, dtype=torch.float16)
-            torch.distributed.broadcast(hidden_states, MASTER_RANK, group = self.pp_group)
-            # NOTE(ningpeiyang): why do synchronize, see WARNING at https://pytorch.org/docs/stable/distributed.html#groups
-            torch.cuda.synchronize()
+            torch.distributed.broadcast(hidden_states, MASTER_RANK, group=self.pp_group)
 
             hidden_states = self.model(
                 hidden_states,

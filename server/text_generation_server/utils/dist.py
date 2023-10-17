@@ -7,7 +7,7 @@ from loguru import logger
 # Tensor Parallelism settings
 RANK = int(os.getenv("RANK", "0"))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
-PP_WORLD_SIZE = int(os.getenv("PP_WORLD_SIZE", "1"))
+PP_WORLD_SIZE = int(os.getenv("PP_WORLD_SIZE", "2"))
 
 # CUDA memory fraction
 MEMORY_FRACTION = float(os.getenv("CUDA_MEMORY_FRACTION", "1.0"))
@@ -87,15 +87,24 @@ def initialize_torch_distributed():
             elif PP_WORLD_SIZE == 2:
                 assert WORLD_SIZE % PP_WORLD_SIZE == 0, f"WORLD_SIZE(which is {WORLD_SIZE}) is not divisible by PP_WORLD_SIZE(which is {PP_WORLD_SIZE})"
                 TP_WORLD_SIZE = WORLD_SIZE // PP_WORLD_SIZE
-                tp_begin_rank = RANK // TP_WORLD_SIZE * TP_WORLD_SIZE
-                tp_ranks = [tp_begin_rank + i for i in range(TP_WORLD_SIZE)]
-                tp_group = torch.distributed.new_group(
-                    ranks=tp_ranks, 
+
+                # NOTE(ningpeiyang): The following logic cannot be simplified, for detail
+                # https://pytorch.org/docs/stable/distributed.html#torch.distributed.new_group
+                tp_ranks0 = [i for i in range(WORLD_SIZE) if i < TP_WORLD_SIZE]
+                tp_group0 = torch.distributed.new_group(
+                    ranks=tp_ranks0, 
+                    timeout=timedelta(seconds=60), 
+                    backend=backend, 
+                    pg_options=options,
+                )         
+                tp_ranks1 = [i for i in range(WORLD_SIZE) if i >= TP_WORLD_SIZE]
+                tp_group1 = torch.distributed.new_group(
+                    ranks=tp_ranks1, 
                     timeout=timedelta(seconds=60), 
                     backend=backend, 
                     pg_options=options,
                 )
-                torch.distributed.barrier(group=torch.distributed.group.WORLD)
+                tp_group = tp_group0 if RANK < TP_WORLD_SIZE else tp_group1
 
                 # For PP=2, who need pp_group: 
                 # (a) The "Master Rank"(RANK=0) in FIRST part, used to do broadcast
@@ -106,8 +115,7 @@ def initialize_torch_distributed():
                                                        timeout=timedelta(seconds=60), 
                                                        backend=backend, 
                                                        pg_options=options,)
-                torch.distributed.barrier(group=torch.distributed.group.WORLD)
-                
+                                
                 return torch.distributed.group.WORLD, tp_group, pp_group, RANK, WORLD_SIZE, TP_WORLD_SIZE, PP_WORLD_SIZE
             else:
                 raise f"Only Support PP_WORLD_SIZE == 2"
