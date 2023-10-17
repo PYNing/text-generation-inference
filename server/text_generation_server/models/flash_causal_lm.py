@@ -1012,7 +1012,7 @@ class FlashCausalLM(Model):
 
             # Shard generations
             # All generations will be appended in the rust sharded client
-            if (i % self.tp_world_size) == (self.rank % self.tp_world_size):
+            if i % self.world_size == self.rank:
                 if stop:
                     # Decode generated tokens
                     output_text = self.decode(

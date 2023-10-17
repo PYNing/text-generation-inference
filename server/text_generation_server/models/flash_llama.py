@@ -33,7 +33,8 @@ class FlashLlama(FlashCausalLM):
         (
             self.process_group,
             self.tp_group,
-            self.pp_group,
+            self.pp_group_0_1,
+            self.pp_group_1_0,
             rank,
             world_size,
             tp_world_size,
@@ -80,7 +81,7 @@ class FlashLlama(FlashCausalLM):
             model = FlashLlamaForCausalLM(config, weights)
         elif pp_world_size == 2:
             stage = 0 if rank < tp_world_size else 1
-            model = FlashLlamaForCausalLM_PP2(config, weights, stage, self.tp_group, self.pp_group,)
+            model = FlashLlamaForCausalLM_PP2(config, weights, stage, self.tp_group, self.pp_group_0_1, self.pp_group_1_0,)
         else:
             raise NotImplementedError("Support No PP or PP=2 only")
 

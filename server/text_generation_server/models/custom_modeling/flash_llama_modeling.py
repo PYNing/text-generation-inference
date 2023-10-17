@@ -636,13 +636,16 @@ class FlashLlamaForCausalLM(torch.nn.Module):
         return logits
 
 class FlashLlamaForCausalLM_PP2(torch.nn.Module):
-    def __init__(self, config, weights, stage, tp_group, pp_group):
+    def __init__(self, config, weights, stage, tp_group, pp_group_0_1, pp_group_1_0):
         super().__init__()
-
         self.stage = stage
         self.tp_group = tp_group
-        self.pp_group = pp_group
+        self.pp_group_0_1 = pp_group_0_1
+        self.pp_group_1_0 = pp_group_1_0
+        self.FIRST_PART_MASTER_RANK = 0
+        self.LAST_PART_MASTER_RANK = self.tp_group.size()
         if self.stage == 0:
+            self.vocab_size = config.vocab_size
             self.model = FlashLlamaModel_PP2_Stage0(config, weights)
         elif self.stage == 1:
             self.hidden_size = config.hidden_size
@@ -678,18 +681,20 @@ class FlashLlamaForCausalLM_PP2(torch.nn.Module):
                 input_lengths,
                 max_s,
             )
-            MASTER_RANK = 0 # For PP=2
             # do reduce whthin tp_group
-            torch.distributed.reduce(hidden_states, MASTER_RANK, group=self.tp_group)
-            # do broadcast whin pp_group
-            # NOTE(ningpeiyang): op will be ignored if current rank not in 'pp_group'
-            torch.distributed.broadcast(hidden_states, MASTER_RANK, group=self.pp_group)
-            # "hidden_states" should no longer be used in this case
-            return None
+            torch.distributed.reduce(hidden_states, self.FIRST_PART_MASTER_RANK, group=self.tp_group)
+            # do broadcast whin pp_group_0_1
+            # NOTE(ningpeiyang): op will be ignored if current rank not in 'pp_group_0_1'
+            torch.distributed.broadcast(hidden_states, self.FIRST_PART_MASTER_RANK, group=self.pp_group_0_1)
+            # get tensor form broadcast whin pp_group_1_0
+            logits_dim0 = input_ids.shape[0] if lm_head_indices is None else lm_head_indices.shape[0]
+            logits = torch.empty(logits_dim0, self.vocab_size, device=input_ids.device, dtype=torch.float16)
+            torch.distributed.broadcast(logits, self.LAST_PART_MASTER_RANK, group=self.pp_group_1_0)
+            return logits
         elif self.stage == 1:
-            MASTER_RANK = 0 # For PP=2
+            # get tensor form broadcast whin pp_group_0_1
             hidden_states = torch.empty(input_ids.shape[0], self.hidden_size, device=input_ids.device, dtype=torch.float16)
-            torch.distributed.broadcast(hidden_states, MASTER_RANK, group=self.pp_group)
+            torch.distributed.broadcast(hidden_states, self.FIRST_PART_MASTER_RANK, group=self.pp_group_0_1)
 
             hidden_states = self.model(
                 hidden_states,
@@ -704,6 +709,12 @@ class FlashLlamaForCausalLM_PP2(torch.nn.Module):
             if lm_head_indices is not None:
                 hidden_states = hidden_states[lm_head_indices]
             logits = self.lm_head(hidden_states)
+
+            # do broadcast whin pp_group_1_0
+            if not logits.is_contiguous():
+                    logits = logits.contiguous()
+            torch.distributed.broadcast(logits, self.LAST_PART_MASTER_RANK, group=self.pp_group_1_0)
+            
             return logits
         else:
             raise NotImplementedError
