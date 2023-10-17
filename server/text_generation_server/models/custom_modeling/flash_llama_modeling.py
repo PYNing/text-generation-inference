@@ -43,6 +43,7 @@ from text_generation_server.utils.layers import (
     get_linear,
 )
 
+from loguru import logger
 
 class LlamaConfig(PretrainedConfig):
     def __init__(
@@ -530,7 +531,7 @@ class FlashLlamaModel_PP2_Stage0(torch.nn.Module):
                 max_s,
             )
 
-        return hidden_states
+        return hidden_states, residual
 
 class FlashLlamaModel_PP2_Stage1(torch.nn.Module):
     def __init__(self, config, weights):
@@ -564,6 +565,7 @@ class FlashLlamaModel_PP2_Stage1(torch.nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor,
         position_ids: torch.Tensor,
         cu_seqlen_prefill: Optional[torch.Tensor],
         kv_cache: List[Tuple[torch.Tensor, torch.Tensor]],
@@ -578,7 +580,6 @@ class FlashLlamaModel_PP2_Stage1(torch.nn.Module):
             position_ids, max_s, hidden_states.dtype
         )
 
-        residual = None
         for i, layer in enumerate(self.layers):
             hidden_states, residual = layer(
                 hidden_states,
@@ -671,21 +672,22 @@ class FlashLlamaForCausalLM_PP2(torch.nn.Module):
         lm_head_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.stage == 0:
-            hidden_states = self.model(
-                input_ids,
-                position_ids,
-                cu_seqlen_prefill,
-                kv_cache,
-                block_tables,
-                slots,
-                input_lengths,
-                max_s,
-            )
-            # do reduce whthin tp_group
+            hidden_states, residual = self.model(input_ids, 
+                                                 position_ids, 
+                                                 cu_seqlen_prefill, 
+                                                 kv_cache, 
+                                                 block_tables, 
+                                                 slots, 
+                                                 input_lengths, 
+                                                 max_s,)
+            # do reduce whthin tp_group        
             torch.distributed.reduce(hidden_states, self.FIRST_PART_MASTER_RANK, group=self.tp_group)
+
             # do broadcast whin pp_group_0_1
             # NOTE(ningpeiyang): op will be ignored if current rank not in 'pp_group_0_1'
-            torch.distributed.broadcast(hidden_states, self.FIRST_PART_MASTER_RANK, group=self.pp_group_0_1)
+            hidden_and_residual = torch.stack((hidden_states, residual), 0)
+            torch.distributed.broadcast(hidden_and_residual, self.FIRST_PART_MASTER_RANK, group=self.pp_group_0_1)
+
             # get tensor form broadcast whin pp_group_1_0
             logits_dim0 = input_ids.shape[0] if lm_head_indices is None else lm_head_indices.shape[0]
             logits = torch.empty(logits_dim0, self.vocab_size, device=input_ids.device, dtype=torch.float16)
@@ -693,11 +695,13 @@ class FlashLlamaForCausalLM_PP2(torch.nn.Module):
             return logits
         elif self.stage == 1:
             # get tensor form broadcast whin pp_group_0_1
-            hidden_states = torch.empty(input_ids.shape[0], self.hidden_size, device=input_ids.device, dtype=torch.float16)
-            torch.distributed.broadcast(hidden_states, self.FIRST_PART_MASTER_RANK, group=self.pp_group_0_1)
+            hidden_and_residual = torch.empty(2, input_ids.shape[0], self.hidden_size, device=input_ids.device, dtype=torch.float16)
+            torch.distributed.broadcast(hidden_and_residual, self.FIRST_PART_MASTER_RANK, group=self.pp_group_0_1)
+            hidden_states, residual = hidden_and_residual[0], hidden_and_residual[1]
 
             hidden_states = self.model(
                 hidden_states,
+                residual,
                 position_ids,
                 cu_seqlen_prefill,
                 kv_cache,
